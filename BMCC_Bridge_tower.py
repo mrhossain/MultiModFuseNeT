@@ -1,0 +1,198 @@
+import pandas as pd
+import numpy as np
+import  torch
+from torch.utils.data import Dataset, DataLoader
+import os
+import re
+from torchvision import transforms, utils
+import cv2
+from torch.cuda.amp import GradScaler, autocast
+from PIL import Image
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+
+from transformers import BridgeTowerModel, BridgeTowerProcessor, AdamW, get_linear_schedule_with_warmup, AutoConfig
+
+label_map = {"Business": 0, "Crime": 1, "Entertainment": 2, "Environment": 3, "Science-Tech": 4, "Others": 5}
+
+
+class FocalLoss(torch.nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            targets = targets.long()  # Ensure targets are long tensor for indexing
+            alpha = self.alpha[targets]  # Index alpha using targets
+            alpha = alpha.view(-1, 1)  # Adjust dimensions for broadcasting
+            #print(f"alpha: {alpha.shape}, focal_loss:{focal_loss.shape}")
+
+            focal_loss = alpha * focal_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+
+class ImageTextDataset(Dataset):
+    def __init__(self, csv_file):
+        self.data = pd.read_csv(csv_file)
+        self.label = self.data["Label"].tolist()
+        self.image_path = self.data["Image_path"].tolist()
+        self.text = self.data["Text"].tolist()
+        self.samples = len(self.data)
+        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.image_size = 224
+        self.tokenizer = BridgeTowerProcessor.from_pretrained('BridgeTower/bridgetower-base')
+
+    def __len__(self):
+        return self.samples
+
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_path[idx])
+        image = image.convert("RGB")
+        image = image.resize((self.image_size, self.image_size))
+        image = self.transform(image)
+        text = self.text[idx]
+        label = self.label[idx]
+        label = label_map[label]
+        encoded_input = self.tokenizer(images=image, text=text, padding='max_length', truncation=True, max_length=14,
+                                   return_tensors='pt')
+        return {
+        'image': encoded_input['pixel_values'].squeeze(0),
+        'input_ids': encoded_input['input_ids'].squeeze(0),
+        'attention_mask': encoded_input['attention_mask'].squeeze(0),
+        'label': torch.tensor(label, dtype=torch.long)
+        }
+
+class BridgeTower(torch.nn.Module):
+    def __init__(self, num_labels=6):
+        super(BridgeTower, self).__init__()
+        self.config = AutoConfig.from_pretrained("BridgeTower/bridgetower-base", num_labels=6)
+        self.config.return_dict = True
+        self.model = BridgeTowerModel.from_pretrained("BridgeTower/bridgetower-base", return_dict=True)
+        self.text_embedding_size = 768
+        self.image_embedding_size = 768
+        self.input_size =  50271
+        self.fc = torch.nn.Linear(self.input_size+1, self.text_embedding_size)
+        self.linear = torch.nn.Linear(self.text_embedding_size+self.image_embedding_size, self.config.num_labels)
+        self.linear_image_or_text_only = torch.nn.Linear(self.text_embedding_size, self.config.num_labels)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(0.1)
+        self.softmax = torch.nn.Softmax(dim=1)
+
+    def forward(self, image, attention_mask, input_ids):
+        # Pass the image, attention_mask, and input_ids to the BridgeTowerModel
+        output = self.model(pixel_values=image, input_ids=input_ids, attention_mask=attention_mask)
+        # Extract the image and text features from the output
+        image_embeds = output.image_features[:,0,:]
+        text_embeds = output.text_features[:,0,:]
+        # Apply activation function to the image and text features
+        image_embeds = self.activation(image_embeds)
+        text_embeds = self.activation(text_embeds)
+        # Concatenate the image and text features
+        #catFeature = torch.cat((image_embeds, text_embeds), dim=1)
+        #print(f"catFeature.shape{catFeature.shape}")
+        # Pass the concatenated features through the linear layer
+        #output = self.linear(catFeature)
+        # Apply softmax to the output of the linear layer
+        output = self.linear_image_or_text_only(text_embeds)
+        output = self.softmax(output)
+        return output
+
+
+
+
+def train():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = BridgeTower()
+    model.load_state_dict(torch.load('./mmbtc-6-model/BridgeTower_lr2e-6-focal_text.pth'))
+    model.to(device)
+    model.train()
+    optimizer = AdamW(model.parameters(), lr=2e-6)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    dataset = ImageTextDataset('./BMMTC6-Final/BMMTC6-Train/train.csv')
+    dataloader = DataLoader(dataset, batch_size=14, shuffle=True)
+    class_counts = [2335, 1000, 3667, 762, 1134, 1784]
+    class_weights = 1. / torch.tensor(class_counts, dtype=torch.float)
+    class_weights = class_weights / class_weights.sum()  # Normalize weights
+    class_weights = class_weights.to(device)
+    criterion = FocalLoss(alpha=class_weights, gamma=2, reduction='mean')
+    #certiation = torch.nn.CrossEntropyLoss()
+    epochs = 30
+    globalLoss = 10000000000
+    for epoch in range(epochs):
+        epoch_loss = 0
+        actual_labels = []
+        predict_labels = []
+        for data in dataloader:
+            image = data['image'].to(device)
+            input_ids = data['input_ids'].to(device)
+            attention_mask = data['attention_mask'].to(device)
+            label = data['label']
+            optimizer.zero_grad()
+            outputs = model(image, attention_mask, input_ids)
+            label = torch.nn.functional.one_hot(label, num_classes=6).to(device)
+            loss =criterion(outputs, label.float())
+            loss.backward()
+            optimizer.step()
+            output = outputs.argmax(dim=1)
+            label = label.argmax(dim=1)
+            output = output.detach().cpu().numpy()
+            label = label.detach().cpu().numpy()
+            predict_labels.extend(output)
+            actual_labels.extend(label)
+            epoch_loss += loss.item()
+
+        acc = accuracy_score(actual_labels, predict_labels)
+        print(f"Epoch: {epoch} Loss: {epoch_loss} Accuracy: {acc}")
+        scheduler.step()
+        if epoch_loss < globalLoss:
+            globalLoss = epoch_loss
+            torch.save(model.state_dict(), './mmbtc-6-model/BridgeTower_lr2e-6-focal_text.pth')
+            print('Model Saved')
+
+
+def test():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = BridgeTower()
+    model.load_state_dict(torch.load('./mmbtc-6-model/BridgeTower_lr2e-6-focal_text.pth'))
+    model.to(device)
+    model.eval()
+    dataset = ImageTextDataset('./BMMTC6-Final/BMMTC6-Test/test.csv')
+    dataloader = DataLoader(dataset, batch_size=14, shuffle=False)
+    actual_labels = []
+    predict_labels = []
+    with torch.no_grad():
+        for data in dataloader:
+            image = data['image'].to(device)
+            input_ids = data['input_ids'].to(device)
+            attention_mask = data['attention_mask'].to(device)
+            label = data['label']
+            output = model(image, attention_mask, input_ids)
+            output = output.argmax(dim=1)
+            output = output.detach().cpu().numpy()
+            label = label.numpy()
+            predict_labels.extend(output)
+            actual_labels.extend(label)
+    acc = accuracy_score(actual_labels, predict_labels)
+    print(f"Accuracy: {acc}")
+    print(f"{classification_report(actual_labels, predict_labels)}")
+    print(f"Confusion Matrix:\n {confusion_matrix(actual_labels, predict_labels)}")
+
+
+if __name__ == '__main__':
+    #train()
+    test()
