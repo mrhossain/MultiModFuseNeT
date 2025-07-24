@@ -1,2 +1,2 @@
 # MultiModFuseNeT
-The BMCC corpus link: https://data.mendeley.com/drafts/htpk9y2pwf
+The BMCC corpus link: https://data.mendeley.com/datasets/htpk9y2pwf/2
